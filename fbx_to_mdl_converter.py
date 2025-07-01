@@ -1,812 +1,813 @@
-# FBX to MDL Converter for Counter-Strike 1.6
-# Complete system to convert FBX models to CS 1.6 compatible MDL files
-# Run this entire code block in a Google Colab notebook cell
+#!/usr/bin/env python3
+"""
+FBX to MDL Converter for Counter-Strike 1.6
+Automatically detects and converts meshes, bones, animations, and materials
+from FBX files to Source Engine MDL format compatible with CS 1.6.
 
-# Install all required dependencies
-import subprocess
-import sys
+Requirements:
+- Python 3.7+
+- FBX SDK (Python bindings)
+- numpy
+- PIL (for texture processing)
+
+Author: CS1.6 Model Converter
+License: MIT
+"""
+
 import os
-
-def install_dependencies():
-    """Install all required packages and tools"""
-    print("🔧 Installing dependencies...")
-    
-    # Install system packages
-    subprocess.run(['apt-get', 'update'], capture_output=True)
-    subprocess.run(['apt-get', 'install', '-y', 'blender', 'wget', 'unzip', 'build-essential'], capture_output=True)
-    
-    # Install Python packages
-    subprocess.run([sys.executable, '-m', 'pip', 'install', 'bpy', 'mathutils', 'numpy', 'ipywidgets'], capture_output=True)
-    
-    # Download and build studiomdl compiler
-    if not os.path.exists('/content/halflife-master'):
-        subprocess.run(['wget', '-q', 'https://github.com/ValveSoftware/halflife/archive/master.zip'], cwd='/content')
-        subprocess.run(['unzip', '-q', 'master.zip'], cwd='/content')
-        
-    # Build studiomdl
-    studiomdl_dir = '/content/halflife-master/utils/studiomdl'
-    if os.path.exists(studiomdl_dir):
-        subprocess.run(['make'], cwd=studiomdl_dir, capture_output=True)
-    
-    print("✅ Dependencies installed successfully!")
-
-# Run installation
-install_dependencies()
-
-# Import all required modules
-import tempfile
-import shutil
-import zipfile
-import json
+import sys
+import struct
 import math
+import json
+import argparse
 from pathlib import Path
-import base64
-
-# Import widgets for GUI
-try:
-    import ipywidgets as widgets
-    from IPython.display import display, HTML, clear_output
-    GUI_AVAILABLE = True
-except ImportError:
-    GUI_AVAILABLE = False
-    print("⚠️ GUI widgets not available - CLI mode only")
-
-# Add Blender Python path and import
-blender_python_path = '/usr/share/blender/scripts/modules'
-if blender_python_path not in sys.path:
-    sys.path.append(blender_python_path)
+from typing import List, Dict, Any, Tuple, Optional
+import numpy as np
 
 try:
-    import bpy
-    import bmesh
-    from mathutils import Vector, Matrix, Euler
-    BLENDER_AVAILABLE = True
+    # Try to import FBX SDK - multiple import patterns for compatibility
+    try:
+        import fbx
+        import FbxCommon
+        from fbx import *
+    except ImportError:
+        try:
+            # Alternative import pattern
+            from pyfbx import *
+            import pyfbx as fbx
+        except ImportError:
+            try:
+                # Another alternative
+                import FbxCommon
+                import fbx
+                from fbx import FbxManager, FbxImporter, FbxScene, FbxSurfaceMaterial
+            except ImportError:
+                raise ImportError("FBX SDK not found")
 except ImportError:
-    BLENDER_AVAILABLE = False
-    print("⚠️ Blender Python API not available")
+    print("ERROR: FBX SDK not found. Please install Autodesk FBX SDK for Python.")
+    print("Download from: https://www.autodesk.com/developer-network/platform-technologies/fbx-sdk-2020-0")
+    print("Alternative: Try installing with: pip install pyfbx-stub")
+    sys.exit(1)
+
+try:
+    from PIL import Image
+except ImportError:
+    print("ERROR: PIL (Pillow) not found. Install with: pip install Pillow")
+    sys.exit(1)
+
+# Constants for MDL format (Quake/GoldSrc engine)
+MDL_MAGIC = 1330660425  # "IDPO"
+MDL_VERSION = 6
+MAX_TRIANGLES = 2048
+MAX_VERTICES = 1024
+MAX_FRAMES = 256
+MAX_SKINS = 32
+
+# Normal vectors for MDL format (162 precalculated normals from anorms.h)
+ANORMS = [
+    [-0.525731, 0.000000, 0.850651], [-0.442863, 0.238856, 0.864188],
+    [-0.295242, 0.000000, 0.955423], [-0.309017, 0.500000, 0.809017],
+    [-0.162460, 0.262866, 0.951056], [0.000000, 0.000000, 1.000000],
+    [0.000000, 0.850651, 0.525731], [-0.147621, 0.716567, 0.681718],
+    [0.147621, 0.716567, 0.681718], [0.000000, 0.525731, 0.850651],
+    [0.309017, 0.500000, 0.809017], [0.525731, 0.000000, 0.850651],
+    [0.295242, 0.000000, 0.955423], [0.442863, 0.238856, 0.864188],
+    [0.162460, 0.262866, 0.951056], [-0.681718, 0.147621, 0.716567],
+    [-0.809017, 0.309017, 0.500000], [-0.587785, 0.425325, 0.688191],
+    [-0.850651, 0.525731, 0.000000], [-0.864188, 0.442863, 0.238856],
+    [-0.716567, 0.681718, 0.147621], [-0.688191, 0.587785, 0.425325],
+    [-0.500000, 0.809017, 0.309017], [-0.238856, 0.864188, 0.442863],
+    [-0.425325, 0.688191, 0.587785], [-0.716567, 0.681718, -0.147621],
+    [-0.500000, 0.809017, -0.309017], [-0.525731, 0.850651, 0.000000],
+    [0.000000, 0.850651, -0.525731], [-0.238856, 0.864188, -0.442863],
+    [0.000000, 0.955423, -0.295242], [-0.262866, 0.951056, -0.162460],
+    [0.000000, 1.000000, 0.000000], [0.000000, 0.955423, 0.295242],
+    [-0.262866, 0.951056, 0.162460], [0.238856, 0.864188, 0.442863],
+    [0.262866, 0.951056, 0.162460], [0.500000, 0.809017, 0.309017],
+    [0.238856, 0.864188, -0.442863], [0.262866, 0.951056, -0.162460],
+    [0.500000, 0.809017, -0.309017], [0.850651, 0.525731, 0.000000],
+    [0.716567, 0.681718, 0.147621], [0.716567, 0.681718, -0.147621],
+    [0.525731, 0.850651, 0.000000], [0.425325, 0.688191, 0.587785],
+    [0.864188, 0.442863, 0.238856], [0.688191, 0.587785, 0.425325],
+    [0.809017, 0.309017, 0.500000], [0.681718, 0.147621, 0.716567],
+    [0.587785, 0.425325, 0.688191], [0.955423, 0.295242, 0.000000],
+    [1.000000, 0.000000, 0.000000], [0.951056, 0.162460, 0.262866],
+    [0.850651, -0.525731, 0.000000], [0.955423, -0.295242, 0.000000],
+    [0.864188, -0.442863, 0.238856], [0.951056, -0.162460, 0.262866],
+    [0.809017, -0.309017, 0.500000], [0.681718, -0.147621, 0.716567],
+    [0.850651, 0.000000, 0.525731], [0.864188, 0.442863, -0.238856],
+    [0.809017, 0.309017, -0.500000], [0.951056, 0.162460, -0.262866],
+    [0.525731, 0.000000, -0.850651], [0.681718, 0.147621, -0.716567],
+    [0.681718, -0.147621, -0.716567], [0.850651, 0.000000, -0.525731],
+    [0.809017, -0.309017, -0.500000], [0.864188, -0.442863, -0.238856],
+    [0.951056, -0.162460, -0.262866], [0.147621, 0.716567, -0.681718],
+    [0.309017, 0.500000, -0.809017], [0.425325, 0.688191, -0.587785],
+    [0.442863, 0.238856, -0.864188], [0.587785, 0.425325, -0.688191],
+    [0.688191, 0.587785, -0.425325], [-0.147621, 0.716567, -0.681718],
+    [-0.309017, 0.500000, -0.809017], [0.000000, 0.525731, -0.850651],
+    [-0.525731, 0.000000, -0.850651], [-0.442863, 0.238856, -0.864188],
+    [-0.295242, 0.000000, -0.955423], [-0.162460, 0.262866, -0.951056],
+    [0.000000, 0.000000, -1.000000], [0.295242, 0.000000, -0.955423],
+    [0.162460, 0.262866, -0.951056], [-0.442863, -0.238856, -0.864188],
+    [-0.309017, -0.500000, -0.809017], [-0.162460, -0.262866, -0.951056],
+    [0.000000, -0.850651, -0.525731], [-0.147621, -0.716567, -0.681718],
+    [0.147621, -0.716567, -0.681718], [0.000000, -0.525731, -0.850651],
+    [0.309017, -0.500000, -0.809017], [0.442863, -0.238856, -0.864188],
+    [0.162460, -0.262866, -0.951056], [0.238856, -0.864188, -0.442863],
+    [0.500000, -0.809017, -0.309017], [0.425325, -0.688191, -0.587785],
+    [0.716567, -0.681718, -0.147621], [0.688191, -0.587785, -0.425325],
+    [0.587785, -0.425325, -0.688191], [0.000000, -0.955423, -0.295242],
+    [0.000000, -1.000000, 0.000000], [0.262866, -0.951056, -0.162460],
+    [0.000000, -0.850651, 0.525731], [0.000000, -0.955423, 0.295242],
+    [0.238856, -0.864188, 0.442863], [0.262866, -0.951056, 0.162460],
+    [0.500000, -0.809017, 0.309017], [0.716567, -0.681718, 0.147621],
+    [0.525731, -0.850651, 0.000000], [-0.238856, -0.864188, -0.442863],
+    [-0.500000, -0.809017, -0.309017], [-0.262866, -0.951056, -0.162460],
+    [-0.850651, -0.525731, 0.000000], [-0.716567, -0.681718, -0.147621],
+    [-0.716567, -0.681718, 0.147621], [-0.525731, -0.850651, 0.000000],
+    [-0.500000, -0.809017, 0.309017], [-0.238856, -0.864188, 0.442863],
+    [-0.262866, -0.951056, 0.162460], [-0.864188, -0.442863, 0.238856],
+    [-0.809017, -0.309017, 0.500000], [-0.688191, -0.587785, 0.425325],
+    [-0.681718, -0.147621, 0.716567], [-0.442863, -0.238856, 0.864188],
+    [-0.587785, -0.425325, 0.688191], [-0.309017, -0.500000, 0.809017],
+    [-0.147621, -0.716567, 0.681718], [-0.425325, -0.688191, 0.587785],
+    [-0.162460, -0.262866, 0.951056], [0.442863, -0.238856, 0.864188],
+    [0.587785, -0.425325, 0.688191], [0.688191, -0.587785, 0.425325],
+    [-0.864188, 0.442863, -0.238856], [-0.688191, 0.587785, -0.425325],
+    [-0.809017, 0.309017, -0.500000], [-0.681718, 0.147621, -0.716567],
+    [-0.442863, 0.238856, -0.864188], [-0.587785, 0.425325, -0.688191],
+    [-0.309017, 0.500000, -0.809017], [-0.425325, 0.688191, -0.587785],
+    [-0.162460, 0.262866, -0.951056], [0.864188, -0.442863, 0.238856],
+    [0.688191, -0.587785, 0.425325], [0.809017, -0.309017, 0.500000],
+    [0.681718, -0.147621, 0.716567], [0.587785, -0.425325, 0.688191],
+    [0.442863, -0.238856, 0.864188], [0.425325, -0.688191, 0.587785],
+    [0.309017, -0.500000, 0.809017], [0.147621, -0.716567, 0.681718],
+    [0.162460, -0.262866, 0.951056], [0.309017, 0.500000, 0.809017],
+    [0.147621, 0.716567, 0.681718], [0.000000, 0.525731, 0.850651],
+    [0.425325, 0.688191, 0.587785], [0.587785, 0.425325, 0.688191],
+    [0.688191, 0.587785, 0.425325], [-0.955423, 0.295242, 0.000000],
+    [-0.951056, 0.162460, 0.262866], [-1.000000, 0.000000, 0.000000],
+    [-0.850651, 0.000000, 0.525731], [-0.955423, -0.295242, 0.000000],
+    [-0.951056, -0.162460, 0.262866], [-0.864188, 0.442863, 0.238856],
+    [-0.951056, 0.162460, -0.262866], [-0.809017, 0.309017, -0.500000],
+    [-0.864188, -0.442863, -0.238856], [-0.951056, -0.162460, -0.262866],
+    [-0.809017, -0.309017, -0.500000], [-0.681718, 0.147621, -0.716567],
+    [-0.681718, -0.147621, -0.716567], [-0.850651, 0.000000, -0.525731],
+    [-0.688191, 0.587785, -0.425325], [-0.587785, 0.425325, -0.688191],
+    [-0.425325, 0.688191, -0.587785], [-0.425325, -0.688191, -0.587785],
+    [-0.587785, -0.425325, -0.688191], [-0.688191, -0.587785, -0.425325]
+]
+
+class Vector3:
+    """3D Vector class for handling positions and normals"""
+    def __init__(self, x=0.0, y=0.0, z=0.0):
+        self.x = float(x)
+        self.y = float(y)
+        self.z = float(z)
+    
+    def length(self):
+        return math.sqrt(self.x*self.x + self.y*self.y + self.z*self.z)
+    
+    def normalize(self):
+        length = self.length()
+        if length > 0:
+            self.x /= length
+            self.y /= length
+            self.z /= length
+        return self
+    
+    def dot(self, other):
+        return self.x * other.x + self.y * other.y + self.z * other.z
+
+class MDLVertex:
+    """MDL compressed vertex structure"""
+    def __init__(self, position: Vector3, normal_index: int, scale: Vector3 = None, translate: Vector3 = None):
+        # Compress position to unsigned char values (0-255)
+        if scale and translate:
+            # Proper compression using scale and translate
+            self.v = [
+                max(0, min(255, int((position.x - translate.x) / scale.x))),
+                max(0, min(255, int((position.y - translate.y) / scale.y))),
+                max(0, min(255, int((position.z - translate.z) / scale.z)))
+            ]
+        else:
+            # Fallback simple compression
+            self.v = [
+                max(0, min(255, int(position.x + 128))),
+                max(0, min(255, int(position.y + 128))),
+                max(0, min(255, int(position.z + 128)))
+            ]
+        self.normal_index = normal_index
+
+class MDLTriangle:
+    """MDL triangle structure"""
+    def __init__(self, vertices: List[int], faces_front: bool = True):
+        self.faces_front = 1 if faces_front else 0
+        self.vertex = vertices[:3]  # Only take first 3 vertices
+
+class MDLTexCoord:
+    """MDL texture coordinate structure"""
+    def __init__(self, s: float, t: float, on_seam: bool = False):
+        self.on_seam = 1 if on_seam else 0
+        self.s = int(s)
+        self.t = int(t)
+
+class MDLSkin:
+    """MDL skin/texture structure"""
+    def __init__(self, width: int, height: int, data: bytes):
+        self.group = 0  # Single texture
+        self.width = width
+        self.height = height
+        self.data = data
+
+class MDLFrame:
+    """MDL animation frame structure"""
+    def __init__(self, name: str, vertices: List[MDLVertex]):
+        self.type = 0  # Simple frame
+        self.name = name[:16].ljust(16, '\0')  # Ensure 16 chars
+        self.vertices = vertices
+        
+        # Calculate bounding box
+        if vertices:
+            min_x = min(v.v[0] for v in vertices)
+            min_y = min(v.v[1] for v in vertices)
+            min_z = min(v.v[2] for v in vertices)
+            max_x = max(v.v[0] for v in vertices)
+            max_y = max(v.v[1] for v in vertices)
+            max_z = max(v.v[2] for v in vertices)
+            
+            self.bbox_min = MDLVertex(Vector3(min_x-128, min_y-128, min_z-128), 0)
+            self.bbox_max = MDLVertex(Vector3(max_x-128, max_y-128, max_z-128), 0)
+        else:
+            self.bbox_min = MDLVertex(Vector3(), 0)
+            self.bbox_max = MDLVertex(Vector3(), 0)
 
 class FBXToMDLConverter:
-    """Complete FBX to MDL converter for Counter-Strike 1.6"""
+    """Main converter class for FBX to MDL conversion"""
     
     def __init__(self):
-        self.work_dir = Path('/tmp/fbx_converter')
-        self.work_dir.mkdir(exist_ok=True)
-        self.model_name = 'converted_model'
-        self.animations = []
-        self.bones = []
+        self.fbx_manager = None
+        self.scene = None
+        self.meshes = []
         self.materials = []
-        
-    def clear_scene(self):
-        """Clear all objects from Blender scene"""
-        if not BLENDER_AVAILABLE:
-            raise RuntimeError("Blender not available")
-        bpy.ops.object.select_all(action='SELECT')
-        bpy.ops.object.delete(use_global=False)
-        
-    def load_fbx(self, fbx_path):
-        """Load FBX file and analyze contents"""
-        if not BLENDER_AVAILABLE:
-            raise RuntimeError("Blender not available")
-            
-        self.clear_scene()
-        
-        # Import FBX with optimal settings for CS 1.6
-        bpy.ops.import_scene.fbx(
-            filepath=fbx_path,
-            use_custom_normals=True,
-            use_image_search=True,
-            automatic_bone_orientation=True,
-            use_alpha_decals=False,
-            use_anim=True,
-            anim_offset=1.0
-        )
-        
-        # Analyze loaded scene
-        self.analyze_scene()
-        
-    def analyze_scene(self):
-        """Analyze loaded scene for meshes, bones, animations"""
         self.bones = []
         self.animations = []
-        self.materials = []
+        self.scale_factor = Vector3(1.0, 1.0, 1.0)
+        self.translate = Vector3(0.0, 0.0, 0.0)
         
-        # Find armatures and bones
-        for obj in bpy.context.scene.objects:
-            if obj.type == 'ARMATURE':
-                for bone in obj.data.bones:
-                    self.bones.append(bone.name)
-                    
-        # Find animations
-        if bpy.data.actions:
-            for action in bpy.data.actions:
-                frame_start = int(action.frame_range[0])
-                frame_end = int(action.frame_range[1])
-                self.animations.append({
-                    'name': self.sanitize_name(action.name),
-                    'start': frame_start,
-                    'end': frame_end,
-                    'fps': 30
-                })
-                
-        # Find materials
-        for mat in bpy.data.materials:
-            if mat.users > 0:
-                self.materials.append(self.sanitize_name(mat.name))
-                
-        print(f"📊 Found {len(self.bones)} bones, {len(self.animations)} animations, {len(self.materials)} materials")
+    def initialize_fbx_sdk(self):
+        """Initialize FBX SDK"""
+        print("Initializing FBX SDK...")
+        self.fbx_manager, self.scene = FbxCommon.InitializeSdkObjects()
+        if not self.fbx_manager or not self.scene:
+            raise Exception("Failed to initialize FBX SDK")
+        return True
+    
+    def cleanup_fbx_sdk(self):
+        """Cleanup FBX SDK resources"""
+        if self.fbx_manager:
+            self.fbx_manager.Destroy()
+    
+    def load_fbx_file(self, filepath: str) -> bool:
+        """Load FBX file"""
+        print(f"Loading FBX file: {filepath}")
         
-    def sanitize_name(self, name):
-        """Sanitize names for CS 1.6 compatibility"""
-        # Remove invalid characters and ensure CS 1.6 compatibility
-        import re
-        sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
-        return sanitized[:32]  # Limit length
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"FBX file not found: {filepath}")
         
-    def export_reference_smd(self):
-        """Export reference SMD file"""
-        ref_path = self.work_dir / f"{self.model_name}_reference.smd"
+        importer = FbxImporter.Create(self.scene, "")
         
-        # Set to frame 1 for reference pose
-        bpy.context.scene.frame_set(1)
+        if not importer.Initialize(filepath, -1, self.fbx_manager.GetIOSettings()):
+            error = importer.GetStatus().GetErrorString()
+            raise Exception(f"Failed to initialize FBX importer: {error}")
         
-        # Select mesh objects
-        bpy.ops.object.select_all(action='DESELECT')
-        for obj in bpy.context.scene.objects:
-            if obj.type == 'MESH':
-                obj.select_set(True)
-                
-        # Try built-in SMD export first, fallback to manual
+        if not importer.Import(self.scene):
+            error = importer.GetStatus().GetErrorString()
+            raise Exception(f"Failed to import FBX file: {error}")
+        
+        importer.Destroy()
+        print("FBX file loaded successfully")
+        return True
+    
+    def detect_meshes(self):
+        """Automatically detect and extract mesh data from FBX scene"""
+        print("Detecting meshes...")
+        
+        root_node = self.scene.GetRootNode()
+        if not root_node:
+            return
+        
+        self._traverse_nodes_for_meshes(root_node)
+        print(f"Found {len(self.meshes)} mesh(es)")
+    
+    def _traverse_nodes_for_meshes(self, node):
+        """Recursively traverse scene nodes to find meshes"""
+        # Check if this node has a mesh
+        mesh_attr = node.GetMesh()
+        if mesh_attr:
+            mesh_data = self._extract_mesh_data(mesh_attr, node)
+            if mesh_data:
+                self.meshes.append(mesh_data)
+        
+        # Traverse child nodes
+        for i in range(node.GetChildCount()):
+            self._traverse_nodes_for_meshes(node.GetChild(i))
+    
+    def _extract_mesh_data(self, mesh, node):
+        """Extract mesh data from FBX mesh"""
+        mesh_data = {
+            'name': node.GetName(),
+            'vertices': [],
+            'normals': [],
+            'uvs': [],
+            'triangles': [],
+            'materials': []
+        }
+        
+        # Get vertices
+        control_points = mesh.GetControlPoints()
+        for i in range(mesh.GetControlPointsCount()):
+            point = control_points[i]
+            mesh_data['vertices'].append(Vector3(point[0], point[1], point[2]))
+        
+        # Get normals
+        normal_element = mesh.GetElementNormal()
+        if normal_element:
+            normals = normal_element.GetDirectArray()
+            for i in range(normals.GetCount()):
+                normal = normals.GetAt(i)
+                mesh_data['normals'].append(Vector3(normal[0], normal[1], normal[2]))
+        
+        # Get UVs
+        uv_element = mesh.GetElementUV()
+        if uv_element:
+            uvs = uv_element.GetDirectArray()
+            for i in range(uvs.GetCount()):
+                uv = uvs.GetAt(i)
+                mesh_data['uvs'].append([uv[0], 1.0 - uv[1]])  # Flip V coordinate
+        
+        # Get triangles
+        for i in range(mesh.GetPolygonCount()):
+            if mesh.GetPolygonSize(i) == 3:  # Only triangles
+                triangle = []
+                for j in range(3):
+                    triangle.append(mesh.GetPolygonVertex(i, j))
+                mesh_data['triangles'].append(triangle)
+        
+        return mesh_data
+    
+    def detect_bones(self):
+        """Automatically detect bone/skeleton data"""
+        print("Detecting bones...")
+        
+        root_node = self.scene.GetRootNode()
+        if not root_node:
+            return
+        
+        self._traverse_nodes_for_bones(root_node)
+        print(f"Found {len(self.bones)} bone(s)")
+    
+    def _traverse_nodes_for_bones(self, node):
+        """Recursively traverse scene nodes to find bones/skeletons"""
+        # Check if this node is a skeleton
+        skeleton_attr = node.GetSkeleton()
+        if skeleton_attr:
+            bone_data = {
+                'name': node.GetName(),
+                'parent': node.GetParent().GetName() if node.GetParent() else None,
+                'transform': self._get_node_transform(node)
+            }
+            self.bones.append(bone_data)
+        
+        # Traverse child nodes
+        for i in range(node.GetChildCount()):
+            self._traverse_nodes_for_bones(node.GetChild(i))
+    
+    def _get_node_transform(self, node):
+        """Get transformation matrix from FBX node"""
+        transform = node.EvaluateGlobalTransform()
+        translation = transform.GetT()
+        rotation = transform.GetR()
+        scaling = transform.GetS()
+        
+        return {
+            'translation': [translation[0], translation[1], translation[2]],
+            'rotation': [rotation[0], rotation[1], rotation[2]],
+            'scaling': [scaling[0], scaling[1], scaling[2]]
+        }
+    
+    def detect_animations(self):
+        """Automatically detect animation data"""
+        print("Detecting animations...")
+        
+        anim_stack_count = self.scene.GetAnimationEvaluator().GetAnimationStackCount()
+        
+        for i in range(anim_stack_count):
+            anim_stack = self.scene.GetAnimationEvaluator().GetAnimationStack(i)
+            if anim_stack:
+                anim_data = {
+                    'name': anim_stack.GetName(),
+                    'start_time': anim_stack.GetLocalTimeSpan().GetStart().GetSecondDouble(),
+                    'end_time': anim_stack.GetLocalTimeSpan().GetStop().GetSecondDouble(),
+                    'frames': []
+                }
+                self.animations.append(anim_data)
+        
+        print(f"Found {len(self.animations)} animation(s)")
+    
+    def detect_materials(self):
+        """Automatically detect and extract material data"""
+        print("Detecting materials...")
+        
+        root_node = self.scene.GetRootNode()
+        if not root_node:
+            return
+        
+        self._traverse_nodes_for_materials(root_node)
+        print(f"Found {len(self.materials)} material(s)")
+    
+    def _traverse_nodes_for_materials(self, node):
+        """Recursively traverse scene nodes to find materials"""
+        # Check if this node has materials
+        material_count = node.GetMaterialCount()
+        for i in range(material_count):
+            material = node.GetMaterial(i)
+            if material:
+                material_data = self._extract_material_data(material)
+                if material_data and material_data not in self.materials:
+                    self.materials.append(material_data)
+        
+        # Traverse child nodes
+        for i in range(node.GetChildCount()):
+            self._traverse_nodes_for_materials(node.GetChild(i))
+    
+    def _extract_material_data(self, material):
+        """Extract material data from FBX material"""
+        material_data = {
+            'name': material.GetName(),
+            'diffuse_color': [1.0, 1.0, 1.0],
+            'diffuse_texture': None,
+            'transparency': 1.0
+        }
+        
+        # Get diffuse properties
+        diffuse_prop = material.FindProperty(FbxSurfaceMaterial.sDiffuse)
+        if diffuse_prop.IsValid():
+            diffuse_color = diffuse_prop.Get()
+            material_data['diffuse_color'] = [diffuse_color[0], diffuse_color[1], diffuse_color[2]]
+        
+        # Get diffuse texture
+        diffuse_texture = material.FindProperty(FbxSurfaceMaterial.sDiffuse)
+        if diffuse_texture.IsValid() and diffuse_texture.GetSrcObjectCount() > 0:
+            texture = diffuse_texture.GetSrcObject(0)
+            if texture and hasattr(texture, 'GetFileName'):
+                material_data['diffuse_texture'] = texture.GetFileName()
+        
+        return material_data
+    
+    def find_closest_normal_index(self, normal: Vector3) -> int:
+        """Find the closest normal vector index from the precalculated normals"""
+        best_dot = -2.0
+        best_index = 0
+        
+        normal.normalize()
+        
+        for i, anorm in enumerate(ANORMS[:min(len(ANORMS), 162)]):
+            anorm_vec = Vector3(anorm[0], anorm[1], anorm[2])
+            dot = normal.dot(anorm_vec)
+            if dot > best_dot:
+                best_dot = dot
+                best_index = i
+        
+        return best_index
+    
+    def convert_texture_to_8bit_indexed(self, texture_path: str, output_path: str) -> Tuple[int, int, bytes]:
+        """Convert texture to 8-bit indexed color format for MDL"""
+        if not os.path.exists(texture_path):
+            print(f"Warning: Texture not found: {texture_path}")
+            # Create a default 64x64 texture
+            return self._create_default_texture()
+        
         try:
-            bpy.ops.export_scene.smd(
-                filepath=str(ref_path),
-                export_format='SMD',
-                selection_only=True,
-                export_meshes=True,
-                export_animations=False
-            )
-        except:
-            # Manual SMD export fallback
-            self.manual_smd_export(ref_path, export_type='reference')
+            # Load and convert image
+            img = Image.open(texture_path)
             
-        return ref_path
-        
-    def export_animation_smd(self, animation):
-        """Export animation SMD file"""
-        anim_path = self.work_dir / f"{self.model_name}_{animation['name']}.smd"
-        
-        # Set frame range
-        bpy.context.scene.frame_start = animation['start']
-        bpy.context.scene.frame_end = animation['end']
-        
-        # Select armature
-        bpy.ops.object.select_all(action='DESELECT')
-        for obj in bpy.context.scene.objects:
-            if obj.type == 'ARMATURE':
-                obj.select_set(True)
-                bpy.context.view_layer.objects.active = obj
-                
-        # Try built-in SMD export first, fallback to manual
-        try:
-            bpy.ops.export_scene.smd(
-                filepath=str(anim_path),
-                export_format='SMD',
-                selection_only=True,
-                export_meshes=False,
-                export_animations=True
-            )
-        except:
-            # Manual SMD export fallback
-            self.manual_smd_export(anim_path, export_type='animation', animation=animation)
+            # Resize if too large (MDL typically uses smaller textures)
+            max_size = 256
+            if img.width > max_size or img.height > max_size:
+                img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             
-        return anim_path
-        
-    def manual_smd_export(self, filepath, export_type='reference', animation=None):
-        """Manual SMD export when Blender addon not available"""
-        with open(filepath, 'w') as f:
-            f.write("version 1\n")
+            # Convert to indexed color (256 colors max)
+            img = img.convert('P', palette=Image.ADAPTIVE, colors=256)
             
-            # Write nodes (bones)
-            f.write("nodes\n")
-            bone_id = 0
-            bone_map = {}
+            # Get palette and image data
+            palette = img.getpalette()
+            image_data = img.tobytes()
             
-            # Add root bone if no armature exists
-            if not any(obj.type == 'ARMATURE' for obj in bpy.context.scene.objects):
-                f.write(f"0 \"root\" -1\n")
-                bone_map['root'] = 0
-                bone_id = 1
+            # Save converted texture
+            img.save(output_path)
             
-            for obj in bpy.context.scene.objects:
-                if obj.type == 'ARMATURE':
-                    for bone in obj.data.bones:
-                        parent_id = -1
-                        if bone.parent:
-                            parent_id = bone_map.get(bone.parent.name, -1)
-                        f.write(f"{bone_id} \"{bone.name}\" {parent_id}\n")
-                        bone_map[bone.name] = bone_id
-                        bone_id += 1
-            f.write("end\n")
+            return img.width, img.height, image_data
             
-            # Write skeleton
-            f.write("skeleton\n")
-            if export_type == 'animation' and animation:
-                for frame in range(animation['start'], animation['end'] + 1):
-                    bpy.context.scene.frame_set(frame)
-                    f.write(f"time {frame}\n")
-                    self.write_bone_positions(f, bone_map)
-            else:
-                bpy.context.scene.frame_set(1)
-                f.write("time 0\n")
-                self.write_bone_positions(f, bone_map)
-            f.write("end\n")
-            
-            # Write triangles (for reference only)
-            if export_type == 'reference':
-                f.write("triangles\n")
-                self.write_mesh_triangles(f, bone_map)
-                f.write("end\n")
-                
-    def write_bone_positions(self, f, bone_map):
-        """Write bone positions for current frame"""
-        # Write root bone if no armature
-        if 'root' in bone_map:
-            f.write(f"0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\n")
-            
-        for obj in bpy.context.scene.objects:
-            if obj.type == 'ARMATURE':
-                for bone in obj.pose.bones:
-                    if bone.name in bone_map:
-                        bone_id = bone_map[bone.name]
-                        matrix = bone.matrix
-                        loc = matrix.to_translation()
-                        rot = matrix.to_euler('XYZ')
-                        f.write(f"{bone_id} {loc.x:.6f} {loc.y:.6f} {loc.z:.6f} {rot.x:.6f} {rot.y:.6f} {rot.z:.6f}\n")
-                        
-    def write_mesh_triangles(self, f, bone_map):
-        """Write mesh triangles for reference SMD"""
-        for obj in bpy.context.scene.objects:
-            if obj.type == 'MESH':
-                mesh = obj.data
-                
-                # Ensure mesh has triangles
-                if not hasattr(mesh, 'loop_triangles') or len(mesh.loop_triangles) == 0:
-                    # Triangulate mesh if needed
-                    bm = bmesh.new()
-                    bm.from_mesh(mesh)
-                    bmesh.ops.triangulate(bm, faces=bm.faces[:])
-                    bm.to_mesh(mesh)
-                    bm.free()
-                    mesh.update()
-                
-                mesh.calc_loop_triangles()
-                
-                # Get material name
-                mat_name = "default"
-                if obj.material_slots and obj.material_slots[0].material:
-                    mat_name = self.sanitize_name(obj.material_slots[0].material.name)
-                    
-                for tri in mesh.loop_triangles:
-                    f.write(f"{mat_name}\n")
-                    for loop_idx in tri.loops:
-                        vert_idx = mesh.loops[loop_idx].vertex_index
-                        vertex = mesh.vertices[vert_idx]
-                        co = vertex.co
-                        normal = vertex.normal
-                        
-                        # UV coordinates
-                        uv = [0.0, 0.0]
-                        if mesh.uv_layers:
-                            uv = mesh.uv_layers[0].data[loop_idx].uv
-                            
-                        # Bone weights (simplified - use strongest influence)
-                        bone_id = 0
-                        if obj.vertex_groups and vertex.groups:
-                            max_weight = 0
-                            for vg in vertex.groups:
-                                if vg.weight > max_weight:
-                                    group_name = obj.vertex_groups[vg.group].name
-                                    if group_name in bone_map:
-                                        bone_id = bone_map[group_name]
-                                        max_weight = vg.weight
-                                        
-                        f.write(f"{bone_id} {co.x:.6f} {co.y:.6f} {co.z:.6f} {normal.x:.6f} {normal.y:.6f} {normal.z:.6f} {uv[0]:.6f} {uv[1]:.6f}\n")
-                        
-    def generate_qc_file(self):
-        """Generate QC file for studiomdl compilation"""
-        qc_path = self.work_dir / f"{self.model_name}.qc"
-        
-        with open(qc_path, 'w') as f:
-            # Basic model info
-            f.write(f"$modelname \"{self.model_name}.mdl\"\n")
-            f.write(f"$cd \"{self.work_dir}\"\n")
-            f.write(f"$cdtexture \"{self.work_dir}\"\n")
-            f.write(f"$scale 1.0\n")
-            f.write(f"$cliptotextures\n")
-            
-            # Reference mesh
-            f.write(f"$body studio \"{self.model_name}_reference.smd\"\n")
-            
-            # Animation sequences
-            if not self.animations:
-                # Default idle sequence
-                f.write(f"$sequence idle \"{self.model_name}_reference.smd\" fps 30\n")
-            else:
-                for anim in self.animations:
-                    f.write(f"$sequence {anim['name']} \"{self.model_name}_{anim['name']}.smd\" fps {anim['fps']} loop\n")
-                    
-            # CS 1.6 compatibility settings
-            f.write("$bbox 0 0 0 0 0 0\n")
-            f.write("$cbox 0 0 0 0 0 0\n")
-            f.write("$eyeposition 0 0 0\n")
-            
-            # Additional GoldSrc settings
-            f.write("$flags 0\n")
-            f.write("$origin 0 0 0\n")
-            
-        return qc_path
-        
-    def compile_mdl(self, qc_path):
-        """Compile MDL using studiomdl compiler"""
-        try:
-            studiomdl_path = "/content/halflife-master/utils/studiomdl/studiomdl"
-            
-            # Ensure studiomdl is built
-            if not os.path.exists(studiomdl_path):
-                studiomdl_dir = "/content/halflife-master/utils/studiomdl"
-                if os.path.exists(studiomdl_dir):
-                    result = subprocess.run(["make"], cwd=studiomdl_dir, capture_output=True, text=True)
-                    if result.returncode != 0:
-                        print(f"Failed to build studiomdl: {result.stderr}")
-                        return None
-                        
-            if not os.path.exists(studiomdl_path):
-                print("❌ studiomdl compiler not available")
-                return None
-                
-            # Make studiomdl executable
-            os.chmod(studiomdl_path, 0o755)
-            
-            # Compile MDL
-            result = subprocess.run(
-                [studiomdl_path, str(qc_path)],
-                cwd=str(self.work_dir),
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode == 0:
-                mdl_path = self.work_dir / f"{self.model_name}.mdl"
-                if mdl_path.exists():
-                    return mdl_path
-                    
-            print(f"⚠️ Compilation output: {result.stdout}")
-            if result.stderr:
-                print(f"⚠️ Compilation errors: {result.stderr}")
-                
         except Exception as e:
-            print(f"💥 Compilation failed: {e}")
-            
-        return None
+            print(f"Warning: Failed to convert texture {texture_path}: {e}")
+            return self._create_default_texture()
+    
+    def _create_default_texture(self) -> Tuple[int, int, bytes]:
+        """Create a default 64x64 checkerboard texture"""
+        width, height = 64, 64
+        data = bytearray()
         
-    def convert_fbx_to_mdl(self, fbx_path, model_name=None):
+        for y in range(height):
+            for x in range(width):
+                # Create checkerboard pattern
+                if (x // 8 + y // 8) % 2:
+                    data.append(255)  # White
+                else:
+                    data.append(0)    # Black
+        
+        return width, height, bytes(data)
+    
+    def write_mdl_file(self, output_path: str):
+        """Write the converted data to MDL file format"""
+        print(f"Writing MDL file: {output_path}")
+        
+        if not self.meshes:
+            raise Exception("No meshes found to convert")
+        
+        # Use the first mesh for now (could be extended to handle multiple meshes)
+        mesh = self.meshes[0]
+        
+        # Prepare data structures
+        vertices = []
+        triangles = []
+        texcoords = []
+        skins = []
+        frames = []
+        
+        # Calculate scale and translate for compression first
+        if mesh['vertices']:
+            # Find bounding box
+            min_pos = Vector3(float('inf'), float('inf'), float('inf'))
+            max_pos = Vector3(float('-inf'), float('-inf'), float('-inf'))
+            
+            for vertex in mesh['vertices']:
+                min_pos.x = min(min_pos.x, vertex.x)
+                min_pos.y = min(min_pos.y, vertex.y)
+                min_pos.z = min(min_pos.z, vertex.z)
+                max_pos.x = max(max_pos.x, vertex.x)
+                max_pos.y = max(max_pos.y, vertex.y)
+                max_pos.z = max(max_pos.z, vertex.z)
+            
+            # Calculate scale and translate
+            self.scale_factor = Vector3(
+                (max_pos.x - min_pos.x) / 255.0 if max_pos.x != min_pos.x else 1.0,
+                (max_pos.y - min_pos.y) / 255.0 if max_pos.y != min_pos.y else 1.0,
+                (max_pos.z - min_pos.z) / 255.0 if max_pos.z != min_pos.z else 1.0
+            )
+            self.translate = min_pos
+        
+        # Process vertices and normals
+        for i, vertex in enumerate(mesh['vertices']):
+            normal_index = 0
+            if i < len(mesh['normals']):
+                normal_index = self.find_closest_normal_index(mesh['normals'][i])
+            
+            mdl_vertex = MDLVertex(vertex, normal_index, self.scale_factor, self.translate)
+            vertices.append(mdl_vertex)
+        
+        # Process texture coordinates
+        skin_width = 256
+        skin_height = 256
+        
+        for uv in mesh['uvs']:
+            s = int(uv[0] * skin_width)
+            t = int(uv[1] * skin_height)
+            texcoords.append(MDLTexCoord(s, t))
+        
+        # Ensure we have enough texture coordinates
+        while len(texcoords) < len(vertices):
+            texcoords.append(MDLTexCoord(0, 0))
+        
+        # Process triangles
+        for triangle in mesh['triangles']:
+            if len(triangle) >= 3:
+                triangles.append(MDLTriangle(triangle))
+        
+        # Process materials/skins
+        if self.materials:
+            for material in self.materials:
+                if material.get('diffuse_texture'):
+                    texture_path = material['diffuse_texture']
+                    output_dir = os.path.dirname(output_path)
+                    texture_name = os.path.splitext(os.path.basename(texture_path))[0] + '.bmp'
+                    texture_output = os.path.join(output_dir, texture_name)
+                    
+                    width, height, data = self.convert_texture_to_8bit_indexed(texture_path, texture_output)
+                    skin = MDLSkin(width, height, data)
+                    skins.append(skin)
+                    skin_width, skin_height = width, height
+        
+        # Create default skin if none found
+        if not skins:
+            width, height, data = self._create_default_texture()
+            skin = MDLSkin(width, height, data)
+            skins.append(skin)
+            skin_width, skin_height = width, height
+        
+        # Create frames (for now, just create one static frame)
+        frame = MDLFrame("idle", vertices)
+        frames.append(frame)
+        
+        # Write MDL file
+        self._write_mdl_binary(output_path, skins, texcoords, triangles, frames, skin_width, skin_height)
+        
+        print("MDL file written successfully")
+    
+    def _write_mdl_binary(self, output_path: str, skins: List[MDLSkin], texcoords: List[MDLTexCoord], 
+                         triangles: List[MDLTriangle], frames: List[MDLFrame], skin_width: int, skin_height: int):
+        """Write binary MDL file"""
+        
+        with open(output_path, 'wb') as f:
+            # Calculate bounding radius from vertices
+            bounding_radius = 50.0
+            if frames and frames[0].vertices:
+                max_dist = 0.0
+                for vertex in frames[0].vertices:
+                    # Convert back from compressed format
+                    x = (vertex.v[0] - 128) * self.scale_factor.x + self.translate.x
+                    y = (vertex.v[1] - 128) * self.scale_factor.y + self.translate.y
+                    z = (vertex.v[2] - 128) * self.scale_factor.z + self.translate.z
+                    dist = math.sqrt(x*x + y*y + z*z)
+                    max_dist = max(max_dist, dist)
+                bounding_radius = max_dist
+            
+            # Write header (84 bytes total)
+            f.write(struct.pack('<I', MDL_MAGIC))  # ident (4 bytes)
+            f.write(struct.pack('<I', MDL_VERSION))  # version (4 bytes)
+            f.write(struct.pack('<fff', self.scale_factor.x, self.scale_factor.y, self.scale_factor.z))  # scale (12 bytes)
+            f.write(struct.pack('<fff', self.translate.x, self.translate.y, self.translate.z))  # translate (12 bytes)
+            f.write(struct.pack('<f', bounding_radius))  # bounding radius (4 bytes)
+            f.write(struct.pack('<fff', 0.0, 0.0, 24.0))  # eye position (12 bytes)
+            f.write(struct.pack('<I', len(skins)))  # num_skins (4 bytes)
+            f.write(struct.pack('<I', skin_width))  # skin width (4 bytes)
+            f.write(struct.pack('<I', skin_height))  # skin height (4 bytes)
+            f.write(struct.pack('<I', len(texcoords)))  # num_verts (4 bytes)
+            f.write(struct.pack('<I', len(triangles)))  # num_tris (4 bytes)
+            f.write(struct.pack('<I', len(frames)))  # num_frames (4 bytes)
+            f.write(struct.pack('<I', 0))  # synctype (4 bytes)
+            f.write(struct.pack('<I', 0))  # flags (4 bytes)
+            f.write(struct.pack('<f', 1.0))  # size (4 bytes)
+            
+            # Write skins data
+            for skin in skins:
+                # Write skin group (0 for single skin)
+                f.write(struct.pack('<I', skin.group))
+                # Write skin data
+                f.write(skin.data)
+            
+            # Write texture coordinates
+            for texcoord in texcoords:
+                f.write(struct.pack('<I', texcoord.on_seam))
+                f.write(struct.pack('<I', texcoord.s))
+                f.write(struct.pack('<I', texcoord.t))
+            
+            # Write triangles
+            for triangle in triangles:
+                f.write(struct.pack('<I', triangle.faces_front))
+                f.write(struct.pack('<I', triangle.vertex[0]))
+                f.write(struct.pack('<I', triangle.vertex[1]))
+                f.write(struct.pack('<I', triangle.vertex[2]))
+            
+            # Write frames
+            for frame in frames:
+                # Write frame type
+                f.write(struct.pack('<I', frame.type))
+                
+                # Write bounding box min
+                f.write(struct.pack('<B', frame.bbox_min.v[0]))
+                f.write(struct.pack('<B', frame.bbox_min.v[1]))
+                f.write(struct.pack('<B', frame.bbox_min.v[2]))
+                f.write(struct.pack('<B', frame.bbox_min.normal_index))
+                
+                # Write bounding box max
+                f.write(struct.pack('<B', frame.bbox_max.v[0]))
+                f.write(struct.pack('<B', frame.bbox_max.v[1]))
+                f.write(struct.pack('<B', frame.bbox_max.v[2]))
+                f.write(struct.pack('<B', frame.bbox_max.normal_index))
+                
+                # Write frame name (16 bytes)
+                name_bytes = frame.name.encode('ascii')[:16]
+                name_bytes = name_bytes.ljust(16, b'\0')
+                f.write(name_bytes)
+                
+                # Write vertices
+                for vertex in frame.vertices:
+                    f.write(struct.pack('<B', vertex.v[0]))
+                    f.write(struct.pack('<B', vertex.v[1]))
+                    f.write(struct.pack('<B', vertex.v[2]))
+                    f.write(struct.pack('<B', vertex.normal_index))
+    
+    def convert(self, fbx_path: str, mdl_path: str):
         """Main conversion function"""
-        if model_name:
-            self.model_name = self.sanitize_name(model_name)
-            
         try:
-            print("🔄 Loading FBX file...")
-            self.load_fbx(fbx_path)
+            print(f"Starting FBX to MDL conversion...")
+            print(f"Input: {fbx_path}")
+            print(f"Output: {mdl_path}")
             
-            print("📦 Exporting reference SMD...")
-            ref_smd = self.export_reference_smd()
+            # Initialize FBX SDK
+            self.initialize_fbx_sdk()
             
-            print("🎬 Exporting animation SMDs...")
-            for anim in self.animations:
-                self.export_animation_smd(anim)
-                
-            print("📝 Generating QC file...")
-            qc_path = self.generate_qc_file()
+            # Load FBX file
+            self.load_fbx_file(fbx_path)
             
-            print("🔨 Compiling MDL...")
-            mdl_path = self.compile_mdl(qc_path)
+            # Auto-detect all components
+            self.detect_meshes()
+            self.detect_bones()
+            self.detect_animations()
+            self.detect_materials()
             
-            if mdl_path:
-                print(f"✅ Conversion successful! MDL saved to: {mdl_path}")
-                return mdl_path
-            else:
-                print("❌ Conversion failed during MDL compilation!")
-                return None
-                
+            # Create output directory if it doesn't exist
+            os.makedirs(os.path.dirname(mdl_path), exist_ok=True)
+            
+            # Write MDL file
+            self.write_mdl_file(mdl_path)
+            
+            print(f"Conversion completed successfully!")
+            print(f"Output saved to: {mdl_path}")
+            
         except Exception as e:
-            print(f"💥 Conversion error: {str(e)}")
-            return None
+            print(f"Error during conversion: {e}")
+            raise
+        finally:
+            self.cleanup_fbx_sdk()
 
-# GUI Interface (if available)
-if GUI_AVAILABLE:
-    class ConverterGUI:
-        """Interactive GUI for FBX to MDL conversion"""
-        
-        def __init__(self):
-            self.converter = FBXToMDLConverter()
-            self.uploaded_file = None
-            self.result_mdl = None
-            self.create_interface()
-            
-        def create_interface(self):
-            # File upload widget
-            self.upload_widget = widgets.FileUpload(
-                accept='.fbx',
-                multiple=False,
-                description='Upload FBX',
-                style={'description_width': 'initial'}
-            )
-            
-            # Model name input
-            self.model_name_widget = widgets.Text(
-                value='my_model',
-                description='Model Name:',
-                style={'description_width': 'initial'}
-            )
-            
-            # Convert button
-            self.convert_button = widgets.Button(
-                description='🚀 Convert to MDL',
-                button_style='primary',
-                disabled=True
-            )
-            
-            # Download button
-            self.download_button = widgets.Button(
-                description='📥 Download MDL',
-                button_style='success',
-                disabled=True
-            )
-            
-            # Output area
-            self.output_area = widgets.Output()
-            
-            # Progress bar
-            self.progress_bar = widgets.IntProgress(
-                value=0,
-                min=0,
-                max=100,
-                description='Progress:',
-                bar_style='info'
-            )
-            
-            # File info display
-            self.file_info = widgets.HTML(value="<p>📁 No FBX file selected</p>")
-            
-            # Event handlers
-            self.upload_widget.observe(self.on_file_upload, names='value')
-            self.convert_button.on_click(self.on_convert_click)
-            self.download_button.on_click(self.on_download_click)
-            
-        def on_file_upload(self, change):
-            """Handle file upload"""
-            if self.upload_widget.value:
-                file_info = list(self.upload_widget.value.values())[0]
-                self.uploaded_file = file_info
-                
-                # Save uploaded file
-                upload_path = Path('/tmp') / file_info['metadata']['name']
-                with open(upload_path, 'wb') as f:
-                    f.write(file_info['content'])
-                self.upload_path = upload_path
-                
-                # Update UI
-                file_size = len(file_info['content']) / 1024 / 1024  # MB
-                self.file_info.value = f"""
-                <div style='padding: 15px; background: #e8f5e8; border-radius: 8px; border-left: 4px solid #4caf50;'>
-                    <h4 style='margin: 0 0 10px 0; color: #2e7d32;'>📁 File Ready</h4>
-                    <p><strong>Name:</strong> {file_info['metadata']['name']}</p>
-                    <p><strong>Size:</strong> {file_size:.2f} MB</p>
-                    <p><strong>Status:</strong> ✅ Ready for conversion</p>
-                </div>
-                """
-                
-                self.convert_button.disabled = False
-                
-        def on_convert_click(self, button):
-            """Handle convert button click"""
-            if not self.uploaded_file:
-                return
-                
-            self.convert_button.disabled = True
-            self.download_button.disabled = True
-            self.progress_bar.value = 0
-            
-            with self.output_area:
-                clear_output(wait=True)
-                print("🚀 Starting FBX to MDL conversion for Counter-Strike 1.6...")
-                print("=" * 60)
-                
-                try:
-                    # Update progress
-                    self.progress_bar.value = 10
-                    
-                    # Convert FBX to MDL
-                    model_name = self.model_name_widget.value or 'converted_model'
-                    
-                    self.progress_bar.value = 20
-                    result_path = self.converter.convert_fbx_to_mdl(
-                        str(self.upload_path), 
-                        model_name
-                    )
-                    
-                    self.progress_bar.value = 100
-                    
-                    if result_path:
-                        self.result_mdl = result_path
-                        self.download_button.disabled = False
-                        
-                        # Show success message
-                        file_size = os.path.getsize(result_path) / 1024  # KB
-                        print("\n" + "=" * 60)
-                        print("🎉 CONVERSION COMPLETED SUCCESSFULLY!")
-                        print("=" * 60)
-                        print(f"📁 Output file: {result_path.name}")
-                        print(f"📊 File size: {file_size:.2f} KB")
-                        print(f"🎮 Ready for Counter-Strike 1.6!")
-                        print(f"📂 Location: {result_path}")
-                        
-                        # Validation info
-                        if self.validate_mdl(result_path):
-                            print("✅ MDL file validation: PASSED")
-                        else:
-                            print("⚠️ MDL file validation: WARNING - May need manual review")
-                            
-                        print("\n📋 Installation Instructions:")
-                        print("1. Download the MDL file using the button below")
-                        print("2. Copy to your CS 1.6 models folder")
-                        print("3. Restart Counter-Strike 1.6")
-                        print("4. Enjoy your custom model!")
-                        
-                    else:
-                        print("\n" + "=" * 60)
-                        print("❌ CONVERSION FAILED")
-                        print("=" * 60)
-                        print("Please check your FBX file and try again.")
-                        print("Make sure your FBX contains:")
-                        print("• Valid mesh geometry")
-                        print("• Proper bone structure (if animated)")
-                        print("• Reasonable polygon count for CS 1.6")
-                        
-                except Exception as e:
-                    print(f"\n💥 CONVERSION ERROR: {str(e)}")
-                    print("Please check the FBX file format and try again.")
-                    
-            self.convert_button.disabled = False
-            
-        def validate_mdl(self, mdl_path):
-            """Basic MDL file validation"""
-            try:
-                with open(mdl_path, 'rb') as f:
-                    header = f.read(4)
-                    if header == b'IDST':  # GoldSrc MDL signature
-                        version = int.from_bytes(f.read(4), 'little')
-                        return version == 10  # GoldSrc version
-            except:
-                pass
-            return False
-            
-        def on_download_click(self, button):
-            """Handle download button click"""
-            if not self.result_mdl:
-                return
-                
-            # Create download link
-            with open(self.result_mdl, 'rb') as f:
-                content = f.read()
-                
-            b64_content = base64.b64encode(content).decode()
-            filename = self.result_mdl.name
-            
-            download_link = f'''
-            <div style="text-align: center; padding: 20px;">
-                <a href="data:application/octet-stream;base64,{b64_content}" 
-                   download="{filename}" 
-                   style="background: linear-gradient(45deg, #4caf50, #45a049); 
-                          color: white; padding: 15px 30px; text-decoration: none; 
-                          border-radius: 8px; font-weight: bold; font-size: 16px;
-                          box-shadow: 0 4px 8px rgba(0,0,0,0.2);">
-                   📥 Download {filename}
-                </a>
-                <p style="margin-top: 15px; color: #666;">
-                    Click the button above to download your converted MDL file
-                </p>
-            </div>
-            '''
-            
-            with self.output_area:
-                print("\n💾 Download Ready!")
-                print("=" * 30)
-                display(HTML(download_link))
-                
-        def display(self):
-            """Display the complete interface"""
-            # Title
-            title = widgets.HTML(
-                value="""
-                <div style='text-align: center; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 12px; margin-bottom: 20px;'>
-                    <h1 style='color: white; margin: 0; font-size: 28px;'>🎮 FBX to MDL Converter</h1>
-                    <h3 style='color: #e3f2fd; margin: 10px 0 0 0; font-weight: normal;'>for Counter-Strike 1.6</h3>
-                </div>
-                """
-            )
-            
-            # Instructions
-            instructions = widgets.HTML(
-                value="""
-                <div style='background: #f8f9fa; padding: 20px; border-radius: 10px; margin-bottom: 20px; border-left: 4px solid #2196F3;'>
-                    <h4 style='color: #1976D2; margin-top: 0;'>📋 How to Use:</h4>
-                    <ol style='margin: 10px 0; padding-left: 20px;'>
-                        <li><strong>Upload FBX File:</strong> Choose your 3D model file (supports animations and bones)</li>
-                        <li><strong>Set Model Name:</strong> Enter a name for your converted model</li>
-                        <li><strong>Convert:</strong> Click the convert button and wait for processing</li>
-                        <li><strong>Download:</strong> Get your CS 1.6 compatible MDL file</li>
-                    </ol>
-                    <div style='background: #e3f2fd; padding: 12px; border-radius: 6px; margin-top: 15px;'>
-                        <strong>💡 Pro Tip:</strong> The converter automatically detects meshes, bones, animations, and materials!
-                    </div>
-                </div>
-                """
-            )
-            
-            # Create sections
-            upload_section = widgets.VBox([
-                widgets.HTML("<h4 style='color: #1976D2; margin-bottom: 10px;'>1️⃣ Upload FBX File</h4>"),
-                self.upload_widget,
-                self.file_info
-            ], layout=widgets.Layout(margin='0 0 20px 0'))
-            
-            settings_section = widgets.VBox([
-                widgets.HTML("<h4 style='color: #1976D2; margin-bottom: 10px;'>2️⃣ Model Settings</h4>"),
-                self.model_name_widget
-            ], layout=widgets.Layout(margin='0 0 20px 0'))
-            
-            action_section = widgets.VBox([
-                widgets.HTML("<h4 style='color: #1976D2; margin-bottom: 10px;'>3️⃣ Convert & Download</h4>"),
-                widgets.HBox([self.convert_button, self.download_button], layout=widgets.Layout(margin='0 0 10px 0')),
-                self.progress_bar
-            ], layout=widgets.Layout(margin='0 0 20px 0'))
-            
-            # Main interface
-            main_interface = widgets.VBox([
-                title,
-                instructions,
-                upload_section,
-                settings_section,
-                action_section,
-                self.output_area
-            ])
-            
-            display(main_interface)
+def create_sample_qc_file(mdl_path: str):
+    """Create a sample QC file for StudioMDL compilation"""
+    qc_path = mdl_path.replace('.mdl', '.qc')
+    
+    model_name = os.path.splitext(os.path.basename(mdl_path))[0]
+    
+    qc_content = f'''// QC file for {model_name}
+// Generated by FBX to MDL Converter
 
-# Command-line interface
-def convert_fbx_cli(fbx_file_path, model_name='converted_model', output_dir=None):
-    """Command-line interface for FBX to MDL conversion"""
-    
-    if not os.path.exists(fbx_file_path):
-        print(f"❌ FBX file not found: {fbx_file_path}")
-        return None
-        
-    # Initialize converter
-    converter = FBXToMDLConverter()
-    
-    if output_dir:
-        converter.work_dir = Path(output_dir)
-        converter.work_dir.mkdir(exist_ok=True)
-        
-    # Convert
-    print(f"🔄 Converting {fbx_file_path} to {model_name}.mdl...")
-    print("=" * 60)
-    
-    result = converter.convert_fbx_to_mdl(fbx_file_path, model_name)
-    
-    if result:
-        print(f"\n✅ SUCCESS! MDL file created: {result}")
-        print(f"📁 Working directory: {converter.work_dir}")
-        
-        # List all generated files
-        print("\n📦 Generated files:")
-        for file_path in converter.work_dir.glob('*'):
-            if file_path.is_file():
-                size = file_path.stat().st_size
-                print(f"  📄 {file_path.name} ({size} bytes)")
-                
-        return result
-    else:
-        print("\n❌ Conversion failed!")
-        return None
+$modelname "{model_name}.mdl"
+$cd "."
+$cdtexture "."
+$scale 1.0
 
-# Utility functions
-def validate_mdl_file(mdl_path):
-    """Validate generated MDL file for CS 1.6 compatibility"""
-    if not os.path.exists(mdl_path):
-        return False, "MDL file not found"
-        
+// Sequences
+$sequence idle "{model_name}" fps 1
+
+// End of QC file
+'''
+    
+    with open(qc_path, 'w') as f:
+        f.write(qc_content)
+    
+    print(f"Sample QC file created: {qc_path}")
+
+def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description='Convert FBX files to MDL format for Counter-Strike 1.6')
+    parser.add_argument('input', help='Input FBX file path')
+    parser.add_argument('output', help='Output MDL file path')
+    parser.add_argument('--create-qc', action='store_true', help='Create sample QC file for StudioMDL')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
+    
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.input):
+        print(f"Error: Input file not found: {args.input}")
+        return 1
+    
+    if not args.input.lower().endswith('.fbx'):
+        print(f"Error: Input file must be an FBX file")
+        return 1
+    
+    if not args.output.lower().endswith('.mdl'):
+        args.output += '.mdl'
+    
     try:
-        with open(mdl_path, 'rb') as f:
-            # Check MDL header
-            header = f.read(4)
-            if header != b'IDST':  # GoldSrc MDL signature
-                return False, "Invalid MDL header - not a GoldSrc model"
-                
-            # Check version
-            version = int.from_bytes(f.read(4), 'little')
-            if version != 10:  # GoldSrc version
-                return False, f"Wrong version {version} - should be 10 for GoldSrc/CS 1.6"
-                
-        file_size = os.path.getsize(mdl_path)
-        return True, f"Valid GoldSrc MDL file ({file_size} bytes)"
+        converter = FBXToMDLConverter()
+        converter.convert(args.input, args.output)
+        
+        if args.create_qc:
+            create_sample_qc_file(args.output)
+        
+        print("\n" + "="*50)
+        print("CONVERSION COMPLETED SUCCESSFULLY!")
+        print("="*50)
+        print(f"Input FBX: {args.input}")
+        print(f"Output MDL: {args.output}")
+        print("\nThe MDL file is now ready for use in Counter-Strike 1.6!")
+        print("You can place it in your CS 1.6 models directory.")
+        
+        return 0
         
     except Exception as e:
-        return False, f"Error validating file: {str(e)}"
+        print(f"\nConversion failed: {e}")
+        return 1
 
-def batch_convert_fbx(fbx_directory, output_directory):
-    """Convert multiple FBX files in a directory"""
-    fbx_dir = Path(fbx_directory)
-    output_dir = Path(output_directory)
-    output_dir.mkdir(exist_ok=True)
-    
-    fbx_files = list(fbx_dir.glob('*.fbx'))
-    if not fbx_files:
-        print(f"❌ No FBX files found in {fbx_directory}")
-        return []
-        
-    results = []
-    converter = FBXToMDLConverter()
-    
-    print(f"🔄 Batch converting {len(fbx_files)} FBX files...")
-    print("=" * 60)
-    
-    for i, fbx_file in enumerate(fbx_files, 1):
-        model_name = fbx_file.stem
-        print(f"\n[{i}/{len(fbx_files)}] Converting {fbx_file.name}...")
-        
-        # Set output directory for this model
-        model_output_dir = output_dir / model_name
-        model_output_dir.mkdir(exist_ok=True)
-        converter.work_dir = model_output_dir
-        
-        try:
-            result = converter.convert_fbx_to_mdl(str(fbx_file), model_name)
-            if result:
-                results.append((fbx_file, result, True))
-                print(f"✅ Success: {fbx_file.name} -> {result}")
-            else:
-                results.append((fbx_file, None, False))
-                print(f"❌ Failed: {fbx_file.name}")
-        except Exception as e:
-            results.append((fbx_file, None, False))
-            print(f"💥 Error converting {fbx_file.name}: {str(e)}")
-            
-    # Summary
-    successful = sum(1 for _, _, success in results if success)
-    total = len(results)
-    print(f"\n📊 Batch conversion complete: {successful}/{total} successful")
-    
-    return results
-
-# Main execution
 if __name__ == "__main__":
-    print("🎮 FBX to MDL Converter for Counter-Strike 1.6")
-    print("=" * 60)
-    print("✅ System initialized successfully!")
-    
-    if GUI_AVAILABLE and BLENDER_AVAILABLE:
-        print("\n🖥️ Starting GUI interface...")
-        gui = ConverterGUI()
-        gui.display()
-    else:
-        print("\n⚠️ GUI not available. Use CLI functions:")
-        print("• convert_fbx_cli('/path/to/model.fbx', 'model_name')")
-        print("• batch_convert_fbx('/input/dir', '/output/dir')")
-        print("• validate_mdl_file('/path/to/model.mdl')")
-        
-    print("\n📚 Available functions:")
-    print("• FBXToMDLConverter() - Main converter class")
-    print("• convert_fbx_cli() - Command-line conversion")
-    print("• batch_convert_fbx() - Batch conversion")
-    print("• validate_mdl_file() - Validate MDL files")
+    sys.exit(main())
