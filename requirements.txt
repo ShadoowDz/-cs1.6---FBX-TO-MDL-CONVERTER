@@ -1,0 +1,4 @@
+numpy>=1.19.0
+Pillow>=8.0.0
+# Note: FBX SDK must be installed separately from Autodesk
+# Download from: https://www.autodesk.com/developer-network/platform-technologies/fbx-sdk-2020-0
