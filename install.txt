@@ -1,0 +1,47 @@
+CS 1.6 Tournament Manager - Installation Instructions
+========================================================
+
+STEP 1: Compile the Plugin
+---------------------------
+1. Copy tournament_manager_extended.sma to your AMX Mod X scripting folder
+2. Open AMX Mod X Studio or use command line compiler:
+   amxxpc tournament_manager_extended.sma
+
+STEP 2: Install Files
+---------------------
+1. Copy tournament_manager_extended.amxx to: cstrike/addons/amxmodx/plugins/
+2. Copy tournament_admins.cfg to: cstrike/addons/amxmodx/configs/
+
+STEP 3: Configure Plugin
+-------------------------
+1. Edit cstrike/addons/amxmodx/configs/plugins.ini
+2. Add this line: tournament_manager_extended.amxx
+
+STEP 4: Configure Admins
+-------------------------
+1. Edit cstrike/addons/amxmodx/configs/tournament_admins.cfg
+2. Add your SteamID (one per line):
+   STEAM_0:1:12345678
+   STEAM_0:0:87654321
+
+STEP 5: Restart Server
+----------------------
+Restart your CS 1.6 server to load the plugin
+
+STEP 6: Test
+------------
+1. Connect to your server
+2. Type in chat: /ts
+3. You should see the Tournament Manager menu
+
+TROUBLESHOOTING:
+- If menu doesn't appear, check if your SteamID is in tournament_admins.cfg
+- Check AMX Mod X logs for any compilation or loading errors
+- Ensure all required modules are loaded (cstrike, fun)
+
+USAGE:
+- say /ts - Opens tournament manager
+- Select players for CT team (5 required)
+- Select players for T team (5 required)
+- Confirm and start tournament
+- Use Rules menu to configure disconnect behavior
